@@ -1,7 +1,10 @@
 package main
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"crypto/tls"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log"
@@ -31,19 +34,32 @@ const slotDuration = 10 * time.Second
 // Global variable for client's clock offset (client's adjusted time relative to server).
 var clientTimeOffset time.Duration
 
-// currentEndpoint calculates the active endpoint using the server's local clock.
-func currentEndpoint() string {
-	slot := int(time.Now().Unix() / int64(slotDuration.Seconds()))
-	index := slot % len(endpoints)
-	return endpoints[index]
+// Shared secret used to derive the pseudorandom endpoint sequence.
+// Both client and server must use the same secret.
+var sharedSecret = "my_shared_secret"
+
+// currentEndpointWithSecret computes the active endpoint using the given time (t) and a pseudorandom
+// sequence derived from the shared secret. It takes the current time slot (t divided by the slot duration),
+// feeds it through an HMAC-SHA256 function with the shared secret, and uses the result to pick an endpoint.
+func currentEndpointWithSecret(t time.Time) string {
+	slot := t.Unix() / int64(slotDuration.Seconds())
+	buf := make([]byte, 8)
+	binary.BigEndian.PutUint64(buf, uint64(slot))
+	mac := hmac.New(sha256.New, []byte(sharedSecret))
+	mac.Write(buf)
+	hash := mac.Sum(nil)
+	idx := int(binary.BigEndian.Uint32(hash[:4])) % len(endpoints)
+	return endpoints[idx]
 }
 
-// currentClientEndpoint calculates the active endpoint for the client using its synchronized clock.
+// currentEndpoint returns the server's active endpoint based on its local clock.
+func currentEndpoint() string {
+	return currentEndpointWithSecret(time.Now())
+}
+
+// currentClientEndpoint returns the client's active endpoint using the synchronized clock.
 func currentClientEndpoint() string {
-	effectiveTime := time.Now().Add(clientTimeOffset)
-	slot := int(effectiveTime.Unix() / int64(slotDuration.Seconds()))
-	index := slot % len(endpoints)
-	return endpoints[index]
+	return currentEndpointWithSecret(time.Now().Add(clientTimeOffset))
 }
 
 // loadServerTLSConfig loads the TLS configuration for the server using certificate files.
@@ -52,7 +68,7 @@ func loadServerTLSConfig() (*tls.Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Optionally, you can set more TLS config options here.
+	// Additional TLS config options can be set here.
 	return &tls.Config{
 		Certificates: []tls.Certificate{cert},
 	}, nil
@@ -94,6 +110,7 @@ func runServerSwitching() {
 				}
 				conn, err := ln.Accept()
 				if err != nil {
+					// Use errors.Is to check if the listener was closed.
 					if errors.Is(err, net.ErrClosed) {
 						return
 					}
@@ -158,7 +175,7 @@ func handleConnection(conn net.Conn, listeningAddress string) {
 // It sends a "SYNC" request and computes an offset based on the server's timestamp.
 func syncClock() {
 	for {
-		activeEndpoint := currentEndpoint() // initial guess based on local time
+		activeEndpoint := currentEndpoint() // initial guess based on local time and secret
 		log.Printf("Attempting clock sync with endpoint %s", activeEndpoint)
 		conn, err := tls.Dial("tcp", activeEndpoint, &tls.Config{
 			// For demonstration purposes only; in production, verify the server's certificate.
