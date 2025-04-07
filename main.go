@@ -1,3 +1,21 @@
+// main.go
+//
+// Copyright (C) 2025 T O'Connor.
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Affero General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU Affero General Public License for more details.
+//
+// You should have received a copy of the GNU Affero General Public License
+// along with this program.  If not, see <https://www.gnu.org/licenses/agpl-3.0.html>.
+//
+
 package main
 
 import (
@@ -15,6 +33,12 @@ import (
 )
 
 // Pre-shared list of endpoints.
+// In a real-world scenario, these would be securely managed and not hardcoded.
+// This is just for demonstration purposes.
+// The endpoints are expected to be reachable and listening on the specified ports.
+// In a production environment, you would typically use a more secure method to manage endpoints.
+// For example, you might use a service discovery mechanism or a secure configuration management system.
+
 var endpoints = []string{
 	"127.0.0.1:8001",
 	"127.0.0.1:8002",
@@ -36,6 +60,8 @@ var clientTimeOffset time.Duration
 
 // Shared secret used to derive the pseudorandom endpoint sequence.
 // Both client and server must use the same secret.
+// In a real-world scenario, this should be securely managed and not hardcoded.
+// This is just for demonstration purposes.
 var sharedSecret = "my_shared_secret"
 
 // currentEndpointWithSecret computes the active endpoint using the given time (t) and a pseudorandom
@@ -63,6 +89,8 @@ func currentClientEndpoint() string {
 }
 
 // loadServerTLSConfig loads the TLS configuration for the server using certificate files.
+// In a production environment, you would typically use a more secure method to manage certificates.
+// For example, you might use a certificate management service or a secure configuration management system.
 func loadServerTLSConfig() (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
 	if err != nil {
