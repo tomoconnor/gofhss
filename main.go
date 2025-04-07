@@ -217,9 +217,58 @@ func syncClock() {
 	}
 }
 
+func robustSyncClock(rounds int) {
+	var offsets []time.Duration
+	for i := 0; i < rounds; i++ {
+		activeEndpoint := currentEndpoint() // initial guess based on local time
+		conn, err := tls.Dial("tcp", activeEndpoint, &tls.Config{
+			InsecureSkipVerify: true,
+		})
+		if err != nil {
+			log.Printf("Clock sync round %d: failed to connect: %v", i, err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		start := time.Now()
+		_, err = conn.Write([]byte("SYNC"))
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		buffer := make([]byte, 64)
+		n, err := conn.Read(buffer)
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		serverUnix, err := strconv.ParseInt(string(buffer[:n]), 10, 64)
+		if err != nil {
+			conn.Close()
+			continue
+		}
+		rtt := time.Since(start)
+		estimatedServerTime := time.Unix(serverUnix, 0)
+		offset := estimatedServerTime.Sub(time.Now().Add(rtt / 2))
+		offsets = append(offsets, offset)
+		conn.Close()
+		time.Sleep(500 * time.Millisecond)
+	}
+	if len(offsets) == 0 {
+		log.Println("Failed to sync clock")
+		return
+	}
+	var sum time.Duration
+	for _, off := range offsets {
+		sum += off
+	}
+	clientTimeOffset = sum / time.Duration(len(offsets))
+	log.Printf("Robust clock sync successful. Estimated offset: %v", clientTimeOffset)
+}
+
 // runClient performs clock sync over TLS, then connects using TLS to the synchronized active endpoint.
 func runClient(message string) {
-	syncClock()
+	robustSyncClock(5) // Perform robust clock sync
+	//syncClock()
 
 	for {
 		activeEndpoint := currentClientEndpoint()
