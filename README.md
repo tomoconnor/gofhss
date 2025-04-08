@@ -33,6 +33,31 @@ This project is a proof-of-concept client-server application designed to improve
 - **Optional Timestamped Messages:**  
   If enabled, messages are prefixed with a timestamp. The server checks that the message timestamp is within an acceptable window to mitigate replay attacks.
 
+
+Absolutely — here's a clean, thoughtful **Acceptable Use** section you can add to your README. It's designed to set ethical expectations, reduce your liability, and discourage abuse while staying friendly and transparent:
+
+---
+
+## 🛡️ Acceptable Use
+
+This software is provided **for educational and research** only.
+
+It is **not** intended to facilitate or hide:
+- Malware command-and-control infrastructure
+- Unauthorized access or intrusion attempts
+- Fraud, impersonation, or harassment
+- Evading lawful monitoring, surveillance, or regulation
+
+### By using this software, you agree to:
+- Use it only in compliance with applicable laws in your jurisdiction
+- Take full responsibility for your actions
+- Respect the privacy and security of others
+
+> **Reminder:** Just because something can evade detection doesn’t mean it should. This project aims to empower *resilience*, not recklessness.
+
+If you’re unsure whether your use case is acceptable, err on the side of caution or seek legal advice
+
+
 ## Prerequisites
 
 - [Go](https://golang.org/dl/) (version 1.18 or later recommended)
