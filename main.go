@@ -37,12 +37,6 @@ import (
 )
 
 // Pre-shared list of endpoints.
-// In a real-world scenario, these would be securely managed and not hardcoded.
-// This is just for demonstration purposes.
-// The endpoints are expected to be reachable and listening on the specified ports.
-// In a production environment, you would typically use a more secure method to manage endpoints.
-// For example, you might use a service discovery mechanism or a secure configuration management system.
-
 var endpoints = []string{
 	"127.0.0.1:8001",
 	"127.0.0.1:8002",
@@ -59,23 +53,18 @@ var endpoints = []string{
 // Duration of each time slot.
 const slotDuration = 10 * time.Second
 
-// Global variable for client's clock offset (client's adjusted time relative to server).
+// Global variable for client's clock offset.
 var clientTimeOffset time.Duration
 
-// Shared secret used to derive the pseudorandom endpoint sequence.
-// Both client and server must use the same secret.
-// In a real-world scenario, this should be securely managed and not hardcoded.
-// This is just for demonstration purposes.
+// Shared secret used for the pseudorandom endpoint selection and challenge–response.
 var sharedSecret = "my_shared_secret"
 
-// Flags to enable optional features.
+// Feature flags.
 var enableRobustSync bool
 var enableTimestamped bool
 var enableChallenge bool
 
-// currentEndpointWithSecret computes the active endpoint using the given time (t) and a pseudorandom
-// sequence derived from the shared secret. It takes the current time slot (t divided by the slot duration),
-// feeds it through an HMAC-SHA256 function with the shared secret, and uses the result to pick an endpoint.
+// currentEndpointWithSecret computes the active endpoint using an HMAC over the current time slot.
 func currentEndpointWithSecret(t time.Time) string {
 	slot := t.Unix() / int64(slotDuration.Seconds())
 	buf := make([]byte, 8)
@@ -87,30 +76,26 @@ func currentEndpointWithSecret(t time.Time) string {
 	return endpoints[idx]
 }
 
-// currentEndpoint returns the server's active endpoint using its local clock.
+// currentEndpoint returns the server's active endpoint.
 func currentEndpoint() string {
 	return currentEndpointWithSecret(time.Now())
 }
 
-// currentClientEndpoint returns the client's active endpoint using the synchronized clock.
+// currentClientEndpoint returns the client's active endpoint (adjusted by sync offset).
 func currentClientEndpoint() string {
 	return currentEndpointWithSecret(time.Now().Add(clientTimeOffset))
 }
 
-// loadServerTLSConfig loads the TLS configuration for the server.
-// In a production environment, you would typically use a more secure method to manage certificates.
-// For example, you might use a certificate management service or a secure configuration management system.
+// loadServerTLSConfig loads TLS certificates.
 func loadServerTLSConfig() (*tls.Config, error) {
 	cert, err := tls.LoadX509KeyPair("server.crt", "server.key")
 	if err != nil {
 		return nil, err
 	}
-	return &tls.Config{
-		Certificates: []tls.Certificate{cert},
-	}, nil
+	return &tls.Config{Certificates: []tls.Certificate{cert}}, nil
 }
 
-// runServerSwitching listens on only the active endpoint using TLS and switches endpoints when the time slot expires.
+// runServerSwitching listens on the active endpoint via TLS and switches endpoints when the slot expires.
 func runServerSwitching() {
 	tlsConfig, err := loadServerTLSConfig()
 	if err != nil {
@@ -134,20 +119,14 @@ func runServerSwitching() {
 		timeUntilSwitch := time.Until(time.Unix(nextSlotStart, 0))
 		log.Printf("Listening on %s for %v", activeEndpoint, timeUntilSwitch)
 
-		// done signals when the current time slot is over.
 		done := make(chan struct{})
-
-		// Accept connections concurrently until the time slot is over.
-
 		go func() {
 			for {
-				// Set a short deadline to allow periodic checks of the done channel.
 				if tcpListener, ok := ln.(*net.TCPListener); ok {
 					tcpListener.SetDeadline(time.Now().Add(1 * time.Second))
 				}
 				conn, err := ln.Accept()
 				if err != nil {
-					// Use errors.Is to check if the listener was closed.
 					if errors.Is(err, net.ErrClosed) {
 						return
 					}
@@ -173,101 +152,163 @@ func runServerSwitching() {
 	}
 }
 
-// handleConnection processes an incoming TLS connection.
-// It performs challenge–response and timestamp verification if enabled.
+// handleConnection processes one incoming TLS connection.
+// It reads one composite message and decides what to do based on its fields.
+// If challenge mode is enabled, the server first sends a challenge and then waits for a composite message
+// that must include a "RESPONSE" field along with other fields.
 func handleConnection(conn net.Conn, listeningAddress string) {
 	defer conn.Close()
 
-	// Verify that the connection is arriving on the active endpoint.
 	if listeningAddress != currentEndpoint() {
 		log.Printf("Connection on inactive endpoint %s, expected %s. Closing.", listeningAddress, currentEndpoint())
 		return
 	}
 
-	// Challenge–response handshake.
+	var compositeMsg string
 	if enableChallenge {
+		// Send challenge.
 		nonce := make([]byte, 16)
-		_, err := rand.Read(nonce)
-		if err != nil {
+		if _, err := rand.Read(nonce); err != nil {
 			log.Printf("Failed to generate challenge nonce: %v", err)
 			return
 		}
 		nonceStr := hex.EncodeToString(nonce)
 		challengeMsg := "CHALLENGE:" + nonceStr
-		_, err = conn.Write([]byte(challengeMsg))
-		if err != nil {
+		if _, err := conn.Write([]byte(challengeMsg)); err != nil {
 			log.Printf("Failed to send challenge: %v", err)
 			return
 		}
-		buffer := make([]byte, 128)
+
+		// Now read a composite message that must include a RESPONSE field.
+		buffer := make([]byte, 1024)
 		n, err := conn.Read(buffer)
 		if err != nil {
-			log.Printf("Failed to read challenge response: %v", err)
+			log.Printf("Failed to read composite message after challenge: %v", err)
 			return
 		}
-		response := string(buffer[:n])
+		compositeMsg = string(buffer[:n])
+		log.Printf("Raw composite message: %s", compositeMsg)
+
+		// Parse composite message.
+		parts := strings.Split(compositeMsg, "|")
+		var responseField, timestampField, msgField, syncField string
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			switch {
+			case strings.HasPrefix(part, "RESPONSE:"):
+				responseField = strings.TrimPrefix(part, "RESPONSE:")
+			case strings.HasPrefix(part, "TIMESTAMP:"):
+				timestampField = strings.TrimPrefix(part, "TIMESTAMP:")
+			case strings.HasPrefix(part, "MSG:"):
+				msgField = strings.TrimPrefix(part, "MSG:")
+			case strings.HasPrefix(part, "CLOCKSYNC"):
+				syncField = "CLOCKSYNC"
+			}
+		}
+
+		// Verify challenge response.
 		mac := hmac.New(sha256.New, []byte(sharedSecret))
 		mac.Write(nonce)
 		expected := hex.EncodeToString(mac.Sum(nil))
-		if response != "RESPONSE:"+expected {
-			log.Printf("Invalid challenge response. Expected RESPONSE:%s, got %s", expected, response)
+		if responseField != expected {
+			log.Printf("Invalid challenge response. Expected RESPONSE:%s, got RESPONSE:%s", expected, responseField)
 			return
 		}
 		log.Printf("Challenge response verified.")
-	}
 
-	// Read the incoming message.
-	buffer := make([]byte, 1024)
-	n, err := conn.Read(buffer)
-	if err != nil {
-		log.Printf("Error reading from connection: %v", err)
-		return
-	}
-	msg := string(buffer[:n])
-
-	// If timestamped messages are enabled, verify the timestamp.
-	if enableTimestamped {
-		parts := strings.SplitN(msg, "|", 2)
-		if len(parts) != 2 {
-			log.Printf("Invalid timestamped message format.")
+		// If this composite message is merely a clock sync request, process it.
+		if syncField == "CLOCKSYNC" {
+			now := time.Now().Unix()
+			if _, err := conn.Write([]byte(fmt.Sprintf("%d", now))); err != nil {
+				log.Printf("Failed to send CLOCKSYNC response: %v", err)
+			} else {
+				log.Printf("Processed CLOCKSYNC request on %s", listeningAddress)
+			}
 			return
 		}
-		tsPart := parts[0]
-		msgPart := parts[1]
-		if !strings.HasPrefix(tsPart, "TIMESTAMP:") {
-			log.Printf("Invalid timestamp prefix.")
+
+		// In challenge mode, we expect at least a MSG field.
+		if enableTimestamped {
+			if timestampField == "" {
+				log.Printf("Timestamp field missing in composite message.")
+				return
+			}
+			tsInt, err := strconv.ParseInt(timestampField, 10, 64)
+			if err != nil {
+				log.Printf("Invalid timestamp: %v", err)
+				return
+			}
+			msgTime := time.Unix(tsInt, 0)
+			if absDuration(time.Since(msgTime)) > 15*time.Second {
+				log.Printf("Timestamp out of acceptable range. Message time: %v, server time: %v", msgTime, time.Now())
+				return
+			}
+		}
+
+		if msgField == "" {
+			log.Printf("MSG field missing in composite message.")
 			return
 		}
-		tsStr := strings.TrimPrefix(tsPart, "TIMESTAMP:")
-		tsInt, err := strconv.ParseInt(tsStr, 10, 64)
+
+		log.Printf("Received on %s: %s", listeningAddress, msgField)
+		if _, err := conn.Write([]byte(fmt.Sprintf("Echo: %s", msgField))); err != nil {
+			log.Printf("Error writing echo response: %v", err)
+		}
+	} else {
+		// Non-challenge mode: read composite message.
+		buffer := make([]byte, 1024)
+		n, err := conn.Read(buffer)
 		if err != nil {
-			log.Printf("Invalid timestamp: %v", err)
+			log.Printf("Error reading composite message: %v", err)
 			return
 		}
-		msgTime := time.Unix(tsInt, 0)
-		if absDuration(time.Since(msgTime)) > 15*time.Second {
-			log.Printf("Timestamp out of acceptable range. Message time: %v, server time: %v", msgTime, time.Now())
+		compositeMsg = string(buffer[:n])
+		log.Printf("Raw composite message: %s", compositeMsg)
+		parts := strings.Split(compositeMsg, "|")
+		var timestampField, msgField, syncField string
+		for _, part := range parts {
+			part = strings.TrimSpace(part)
+			switch {
+			case strings.HasPrefix(part, "TIMESTAMP:"):
+				timestampField = strings.TrimPrefix(part, "TIMESTAMP:")
+			case strings.HasPrefix(part, "MSG:"):
+				msgField = strings.TrimPrefix(part, "MSG:")
+			case strings.HasPrefix(part, "CLOCKSYNC"):
+				syncField = "CLOCKSYNC"
+			}
+		}
+		if syncField == "CLOCKSYNC" {
+			now := time.Now().Unix()
+			if _, err := conn.Write([]byte(fmt.Sprintf("%d", now))); err != nil {
+				log.Printf("Failed to send CLOCKSYNC response: %v", err)
+			} else {
+				log.Printf("Processed CLOCKSYNC request on %s", listeningAddress)
+			}
 			return
 		}
-		msg = msgPart
-	}
-
-	// Handle a clock sync request.
-	if msg == "SYNC" {
-		now := time.Now().Unix()
-		_, err := conn.Write([]byte(fmt.Sprintf("%d", now)))
-		if err != nil {
-			log.Printf("Failed to send SYNC response: %v", err)
-		} else {
-			log.Printf("Processed SYNC request on %s", listeningAddress)
+		if enableTimestamped {
+			if timestampField == "" {
+				log.Printf("Timestamp field missing in composite message.")
+				return
+			}
+			tsInt, err := strconv.ParseInt(timestampField, 10, 64)
+			if err != nil {
+				log.Printf("Invalid timestamp: %v", err)
+				return
+			}
+			msgTime := time.Unix(tsInt, 0)
+			if absDuration(time.Since(msgTime)) > 15*time.Second {
+				log.Printf("Timestamp out of acceptable range. Message time: %v, server time: %v", msgTime, time.Now())
+				return
+			}
 		}
-		return
-	}
-
-	log.Printf("Received on %s: %s", listeningAddress, msg)
-	_, err = conn.Write([]byte(fmt.Sprintf("Echo: %s", msg)))
-	if err != nil {
-		log.Printf("Error writing response: %v", err)
+		if msgField == "" {
+			msgField = compositeMsg
+		}
+		log.Printf("Received on %s: %s", listeningAddress, msgField)
+		if _, err := conn.Write([]byte(fmt.Sprintf("Echo: %s", msgField))); err != nil {
+			log.Printf("Error writing echo response: %v", err)
+		}
 	}
 }
 
@@ -280,6 +321,7 @@ func absDuration(d time.Duration) time.Duration {
 }
 
 // syncClock performs a single round of clock synchronization.
+// If timestamped messages are enabled, the client sends a composite message: TIMESTAMP and CLOCKSYNC.
 func syncClock() {
 	for {
 		activeEndpoint := currentEndpoint()
@@ -290,10 +332,50 @@ func syncClock() {
 			time.Sleep(2 * time.Second)
 			continue
 		}
-		start := time.Now()
-		_, err = conn.Write([]byte("SYNC"))
+
+		var syncMsg string
+		if enableChallenge {
+			// Read challenge from server
+			buffer := make([]byte, 128)
+			n, err := conn.Read(buffer)
+			if err != nil {
+				log.Printf("Clock sync: failed to read challenge: %v", err)
+				conn.Close()
+				continue
+			}
+			challengeMsg := string(buffer[:n])
+			if !strings.HasPrefix(challengeMsg, "CHALLENGE:") {
+				log.Printf("Clock sync: expected challenge message, got: %s", challengeMsg)
+				conn.Close()
+				continue
+			}
+			nonceStr := strings.TrimPrefix(challengeMsg, "CHALLENGE:")
+			nonce, err := hex.DecodeString(nonceStr)
+			if err != nil {
+				log.Printf("Clock sync: invalid challenge nonce: %v", err)
+				conn.Close()
+				continue
+			}
+			mac := hmac.New(sha256.New, []byte(sharedSecret))
+			mac.Write(nonce)
+			responseVal := hex.EncodeToString(mac.Sum(nil))
+
+			if enableTimestamped {
+				syncMsg = fmt.Sprintf("RESPONSE:%s|TIMESTAMP:%d|CLOCKSYNC", responseVal, time.Now().Unix())
+			} else {
+				syncMsg = fmt.Sprintf("RESPONSE:%s|CLOCKSYNC", responseVal)
+			}
+		} else {
+			if enableTimestamped {
+				syncMsg = fmt.Sprintf("TIMESTAMP:%d|CLOCKSYNC", time.Now().Unix())
+			} else {
+				syncMsg = "CLOCKSYNC"
+			}
+		}
+
+		_, err = conn.Write([]byte(syncMsg))
 		if err != nil {
-			log.Printf("Clock sync: failed to send SYNC: %v", err)
+			log.Printf("Clock sync: failed to send sync message: %v", err)
 			conn.Close()
 			continue
 		}
@@ -304,14 +386,14 @@ func syncClock() {
 			conn.Close()
 			continue
 		}
-		serverTimeStr := string(buffer[:n])
+		serverTimeStr := strings.TrimSpace(string(buffer[:n]))
 		serverUnix, err := strconv.ParseInt(serverTimeStr, 10, 64)
 		if err != nil {
 			log.Printf("Clock sync: failed to parse server time: %v", err)
 			conn.Close()
 			continue
 		}
-		rtt := time.Since(start)
+		rtt := time.Since(time.Now()) // RTT measurement here is approximate.
 		estimatedServerTime := time.Unix(serverUnix, 0)
 		clientTimeOffset = estimatedServerTime.Sub(time.Now().Add(rtt / 2))
 		log.Printf("Clock sync successful. Estimated offset: %v", clientTimeOffset)
@@ -320,7 +402,7 @@ func syncClock() {
 	}
 }
 
-// robustSyncClock performs multiple rounds of synchronization and averages the offsets.
+// robustSyncClock performs multiple rounds of clock synchronization.
 func robustSyncClock(rounds int) {
 	var offsets []time.Duration
 	for i := 0; i < rounds; i++ {
@@ -331,8 +413,49 @@ func robustSyncClock(rounds int) {
 			time.Sleep(1 * time.Second)
 			continue
 		}
+
+		var syncMsg string
+		if enableChallenge {
+			// Read challenge from server
+			buffer := make([]byte, 128)
+			n, err := conn.Read(buffer)
+			if err != nil {
+				log.Printf("Clock sync round %d: failed to read challenge: %v", i, err)
+				conn.Close()
+				continue
+			}
+			challengeMsg := string(buffer[:n])
+			if !strings.HasPrefix(challengeMsg, "CHALLENGE:") {
+				log.Printf("Clock sync round %d: expected challenge message, got: %s", i, challengeMsg)
+				conn.Close()
+				continue
+			}
+			nonceStr := strings.TrimPrefix(challengeMsg, "CHALLENGE:")
+			nonce, err := hex.DecodeString(nonceStr)
+			if err != nil {
+				log.Printf("Clock sync round %d: invalid challenge nonce: %v", i, err)
+				conn.Close()
+				continue
+			}
+			mac := hmac.New(sha256.New, []byte(sharedSecret))
+			mac.Write(nonce)
+			responseVal := hex.EncodeToString(mac.Sum(nil))
+
+			if enableTimestamped {
+				syncMsg = fmt.Sprintf("RESPONSE:%s|TIMESTAMP:%d|CLOCKSYNC", responseVal, time.Now().Unix())
+			} else {
+				syncMsg = fmt.Sprintf("RESPONSE:%s|CLOCKSYNC", responseVal)
+			}
+		} else {
+			if enableTimestamped {
+				syncMsg = fmt.Sprintf("TIMESTAMP:%d|CLOCKSYNC", time.Now().Unix())
+			} else {
+				syncMsg = "CLOCKSYNC"
+			}
+		}
+
 		start := time.Now()
-		_, err = conn.Write([]byte("SYNC"))
+		_, err = conn.Write([]byte(syncMsg))
 		if err != nil {
 			conn.Close()
 			continue
@@ -343,7 +466,7 @@ func robustSyncClock(rounds int) {
 			conn.Close()
 			continue
 		}
-		serverUnix, err := strconv.ParseInt(string(buffer[:n]), 10, 64)
+		serverUnix, err := strconv.ParseInt(strings.TrimSpace(string(buffer[:n])), 10, 64)
 		if err != nil {
 			conn.Close()
 			continue
@@ -368,6 +491,8 @@ func robustSyncClock(rounds int) {
 }
 
 // runClient performs clock synchronization and sends a message over TLS.
+// In challenge mode, the composite message sent includes a RESPONSE field (from the challenge)
+// in addition to TIMESTAMP (if enabled) and MSG.
 func runClient(message string) {
 	if enableRobustSync {
 		robustSyncClock(5)
@@ -377,9 +502,7 @@ func runClient(message string) {
 
 	for {
 		activeEndpoint := currentClientEndpoint()
-		dialer := &net.Dialer{
-			Timeout: 5 * time.Second,
-		}
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
 
 		log.Printf("Client connecting to endpoint %s", activeEndpoint)
 		conn, err := tls.DialWithDialer(dialer, "tcp", activeEndpoint, &tls.Config{InsecureSkipVerify: true})
@@ -390,9 +513,9 @@ func runClient(message string) {
 		}
 		log.Printf("Connected to %s", activeEndpoint)
 
-		// Challenge–response handshake.
+		var compositeMsg string
 		if enableChallenge {
-			log.Printf("Performing challenge-response handshake.")
+			// Read challenge from server.
 			buffer := make([]byte, 128)
 			n, err := conn.Read(buffer)
 			if err != nil {
@@ -415,34 +538,22 @@ func runClient(message string) {
 			}
 			mac := hmac.New(sha256.New, []byte(sharedSecret))
 			mac.Write(nonce)
-			response := "RESPONSE:" + hex.EncodeToString(mac.Sum(nil))
-			_, err = conn.Write([]byte(response))
-			if err != nil {
-				log.Printf("Failed to send challenge response: %v", err)
-				conn.Close()
-				continue
+			responseVal := hex.EncodeToString(mac.Sum(nil))
+			if enableTimestamped {
+				compositeMsg = fmt.Sprintf("RESPONSE:%s|TIMESTAMP:%d|MSG:%s", responseVal, time.Now().Unix(), message)
+			} else {
+				compositeMsg = fmt.Sprintf("RESPONSE:%s|MSG:%s", responseVal, message)
 			}
-			log.Printf("Challenge response sent.")
-
-			// Check if the endpoint is still the same.
-			// If the active endpoint has changed during the handshake,
-			// abort and retry.
-			if currentClientEndpoint() != activeEndpoint {
-				log.Printf("Endpoint changed during challenge handshake. Aborting connection.")
-				conn.Close()
-				continue
+		} else {
+			if enableTimestamped {
+				compositeMsg = fmt.Sprintf("TIMESTAMP:%d|MSG:%s", time.Now().Unix(), message)
+			} else {
+				compositeMsg = fmt.Sprintf("MSG:%s", message)
 			}
 		}
 
-		// If timestamped messages are enabled, prepend a timestamp.
-		if enableTimestamped {
-			timestamp := time.Now().Unix()
-			message = fmt.Sprintf("TIMESTAMP:%d|MSG:%s", timestamp, message)
-		}
-
-		_, err = conn.Write([]byte(message))
-		if err != nil {
-			log.Printf("Failed to send message: %v", err)
+		if _, err := conn.Write([]byte(compositeMsg)); err != nil {
+			log.Printf("Failed to send composite message: %v", err)
 			conn.Close()
 			continue
 		}
