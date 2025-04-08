@@ -34,10 +34,6 @@ This project is a proof-of-concept client-server application designed to improve
   If enabled, messages are prefixed with a timestamp. The server checks that the message timestamp is within an acceptable window to mitigate replay attacks.
 
 
-Absolutely — here's a clean, thoughtful **Acceptable Use** section you can add to your README. It's designed to set ethical expectations, reduce your liability, and discourage abuse while staying friendly and transparent:
-
----
-
 ## 🛡️ Acceptable Use
 
 This software is provided **for educational and research** only.
