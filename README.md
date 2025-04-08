@@ -55,7 +55,7 @@ It is **not** intended to facilitate or hide:
 
 > **Reminder:** Just because something can evade detection doesn’t mean it should. This project aims to empower *resilience*, not recklessness.
 
-If you’re unsure whether your use case is acceptable, err on the side of caution or seek legal advice
+If you’re unsure whether your use case is acceptable, err on the side of caution and seek legal advice
 
 
 ## Prerequisites
